@@ -1,4 +1,4 @@
-# CRACCON-CTF
+# CRACCON-CTF 2025
 Writeup for CRACCON CTF, online Qualifiers
 
 and,
