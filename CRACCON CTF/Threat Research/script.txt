@@ -1,0 +1,308 @@
+#!/usr/bin/env python3
+"""
+reconstruct_flag.py
+
+Recreates the core LCG / RSA-style recovery:
+ - recover modulus 'n' from an output sequence s[]
+ - factor n (trial division; n < 2^32 is expected)
+ - recover LCG parameters a (= m^e mod n) and c
+ - recover the original seed-block s0
+ - recover m by repeated modular square-root (since e = 2**65537)
+ - rebuild the 4x4-byte message (n, s0, c, m) and show candidate decodings
+
+Notes:
+ - The original challenge used:
+       s[i+1] = ( s[i] * pow(m, 2**65537, n) + c ) % n
+   and the flag bytes are the concatenation of 4 big-endian 4-byte blocks:
+       blocks = [n, s0, c, m]  (each as 4 bytes)
+ - After recovering the 16 bytes, many CTFs *then* require interpreting those bytes
+   further (PowerShell command, percent-unquote, XOR, little/big endian swap, etc).
+   This script prints the raw bytes plus a few common decodings and provides hooks
+   to try simple transformations that often produce a final readable flag.
+
+If repeated modular square-root fails (gcd issues), you can pass the known m value
+(as done in some of our earlier runs) or use the alternative branch (n-m).
+"""
+
+from math import gcd
+from Crypto.Util.number import long_to_bytes, inverse
+import sys
+import binascii
+import urllib.parse
+import itertools
+import re
+
+# Given LCG outputs from challenge
+S = [1471188920, 8580498, 528503476, 577384753, 534687615, 631132756,
+     1181691587, 494356384, 450508778, 224733577, 240456085]
+
+E = 2**65537  # exponent used in the challenge (a = m^E mod n)
+
+# ----------------- Helpers: math / LCG recovery -----------------
+def recover_modulus(seq):
+    diffs = [(seq[i+1] - seq[i]) for i in range(len(seq)-1)]
+    dets = []
+    for i in range(len(diffs)-2):
+        d0 = diffs[i]
+        d1 = diffs[i+1]
+        d2 = diffs[i+2]
+        dets.append(d2 * d0 - d1 * d1)
+    g = 0
+    for D in dets:
+        if D != 0:
+            g = abs(D) if g == 0 else gcd(g, abs(D))
+    return g
+
+def factor_small(n):
+    """Trial divide n (sufficient for 32-bit n)."""
+    facs = []
+    x = n
+    while x % 2 == 0:
+        facs.append(2); x //= 2
+    f = 3
+    while f * f <= x:
+        while x % f == 0:
+            facs.append(f); x //= f
+        f += 2
+    if x > 1:
+        facs.append(x)
+    return facs
+
+def verify_lcg(a, c, n, seed, seq):
+    cur = seed
+    for expected in seq:
+        # note attacker script printed s starting at s[0] which is (s0*a + c) % n
+        cur = (cur * a + c) % n
+        if cur != expected:
+            return False
+    return True
+
+def solve_for_a_c(seq, n):
+    """Solve (s2 - s1) = a * (s1 - s0) (mod n) and find valid (a,c) that regenerate seq."""
+    s0, s1, s2 = seq[0], seq[1], seq[2]
+    num = (s2 - s1) % n
+    den = (s1 - s0) % n
+    g = gcd(den, n)
+    if num % g != 0:
+        raise ValueError("No solution: num not divisible by gcd(den,n).")
+    den_r = den // g
+    num_r = num // g
+    mod_r = n // g
+    inv_den_r = inverse(den_r, mod_r)
+    a0 = (num_r * inv_den_r) % mod_r
+    candidates = [(a0 + t * mod_r) % n for t in range(g)]
+    for a in candidates:
+        c = (s1 - a * s0) % n
+        # regenerate and check
+        cur = s0
+        ok = True
+        for expected in seq[1:]:
+            cur = (cur * a + c) % n
+            if cur != expected:
+                ok = False
+                break
+        if ok:
+            return a, c
+    raise ValueError("Couldn't find a valid (a,c) pair that regenerates sequence")
+
+def recover_s0(s_out, a, c, n):
+    """Solve a * s0 ≡ (s_out - c) (mod n) for s0 using gcd splitting."""
+    rhs = (s_out - c) % n
+    g = gcd(a, n)
+    if rhs % g != 0:
+        raise ValueError("Cannot recover s0 (no solution).")
+    a_r = a // g
+    rhs_r = rhs // g
+    mod_r = n // g
+    inv_a_r = inverse(a_r, mod_r)
+    s0_base = (rhs_r * inv_a_r) % mod_r
+    return s0_base
+
+# ----------------- Tonelli-Shanks (modular sqrt) -----------------
+def tonelli_shanks(nr, p):
+    nr %= p
+    if nr == 0:
+        return 0
+    if p == 2:
+        return nr
+    if pow(nr, (p-1)//2, p) != 1:
+        return None
+    q = p - 1
+    s = 0
+    while q % 2 == 0:
+        s += 1
+        q //= 2
+    if s == 1:
+        return pow(nr, (p+1)//4, p)
+    # find non-residue z
+    z = 2
+    while pow(z, (p-1)//2, p) != p-1:
+        z += 1
+    c = pow(z, q, p)
+    r = pow(nr, (q+1)//2, p)
+    t = pow(nr, q, p)
+    m = s
+    while True:
+        if t % p == 1:
+            return r
+        # find least i where t^(2^i) == 1
+        i = 1
+        t2i = pow(t, 2, p)
+        while i < m:
+            if t2i % p == 1:
+                break
+            t2i = pow(t2i, 2, p)
+            i += 1
+        b = pow(c, 1 << (m - i - 1), p)
+        r = (r * b) % p
+        t = (t * b * b) % p
+        c = (b * b) % p
+        m = i
+
+def repeated_sqrt_mod_prime(a_val, p, times, choose_smaller=True, early_abort=False):
+    """
+    Repeatedly apply modular sqrt 'times' times.
+    choose_smaller: choose the smaller representative between r and p-r at each step.
+    early_abort: if True, stop and return None if any intermediate root is non-residue.
+    """
+    x = a_val % p
+    if p == 2:
+        return x
+    for i in range(times):
+        r = tonelli_shanks(x, p)
+        if r is None:
+            if early_abort:
+                return None
+            # if it fails, there's no square root at this step
+            return None
+        if choose_smaller:
+            x = r if r <= p - r else p - r
+        else:
+            x = p - r if r <= p - r else r
+    return x
+
+# ----------------- Decoding / heuristics -----------------
+def ascii_view(bs):
+    try:
+        return bs.decode('ascii')
+    except Exception:
+        return ''.join(chr(b) if 32 <= b < 127 else "\\x%02x" % b for b in bs)
+
+def try_simple_transforms(bs):
+    """Try a few quick transforms that sometimes CTF authors use after recovering bytes."""
+    tries = []
+    # 1) ASCII big-endian bytes (already bs)
+    tries.append(("ascii", ascii_view(bs)))
+    # 2) ASCII little-endian per-4-byte block
+    le = b''.join(bs[i:i+4][::-1] for i in range(0, len(bs), 4))
+    tries.append(("ascii_little_per_block", ascii_view(le)))
+    # 3) UTF-16-LE (common for Windows/PowerShell)
+    try:
+        tries.append(("utf16le", bs.decode('utf-16le')))
+    except Exception:
+        tries.append(("utf16le", None))
+    # 4) percent-unquote if it looks like %xx sequences
+    try:
+        s = bs.decode('latin1')
+        if '%' in s:
+            tries.append(("url_unquote", urllib.parse.unquote(s)))
+    except Exception:
+        pass
+    # 5) treat bs as hex string and unhex
+    try:
+        hexstr = bs.decode('ascii')
+        # if it looks hex-like (only 0-9a-fA-F)
+        if re.fullmatch(r'[0-9a-fA-F]+', hexstr):
+            tries.append(("unhex", binascii.unhexlify(hexstr)))
+    except Exception:
+        pass
+    # 6) brute-force single-byte XOR keys (0..255) if it reveals readable flag-like text
+    for k in range(1, 64):
+        x = bytes([b ^ k for b in bs])
+        if b"CRACCON{" in x or b"craccon{" in x or b"shell" in x.lower() or b"let_" in x.lower() or b"sh3ll" in x.lower():
+            tries.append((f"xor_{k}", ascii_view(x)))
+    return tries
+
+# ----------------- Driver: perform recovery and print candidates -----------------
+def main(try_repeated_sqrt=True, use_known_m_candidates=None):
+    print("[*] Starting recovery from sequence S (len=%d)" % len(S))
+    n = recover_modulus(S)
+    print("[*] Recovered modulus candidate n =", n)
+    facts = factor_small(n)
+    print("[*] Small factorization result:", facts)
+    # Solve a and c
+    a, c = solve_for_a_c(S, n)
+    print("[*] Recovered a =", a, "c =", c)
+    s0 = recover_s0(S[0], a, c, n)
+    print("[*] Recovered s0 =", s0)
+
+    # Attempt to recover m by repeated modular square-root (if requested)
+    m_candidates = []
+    if try_repeated_sqrt:
+        # if n is composite with multiple primes we'd take sqrt per-prime and CRT them;
+        # when n is prime we can directly repeated-sqrt mod n.
+        # We'll try two deterministic branch strategies (choose_smaller True/False).
+        print("[*] Attempting repeated sqrt method (may take time)...")
+        for choose_smaller in (True, False):
+            root = repeated_sqrt_mod_prime(a % n, n, 65537, choose_smaller=choose_smaller, early_abort=True)
+            print("    branch choose_smaller=%s -> %s" % (choose_smaller, "found" if root is not None else "failed"))
+            if root is not None:
+                m_candidates.append(root)
+                m_candidates.append((n - root) % n)
+    # allow user-provided m candidates (e.g., from an earlier run or hint)
+    if use_known_m_candidates:
+        for mval in use_known_m_candidates:
+            if mval not in m_candidates:
+                m_candidates.append(mval)
+
+    # Remove duplicates, keep order
+    seen = set()
+    m_candidates_uniq = []
+    for m in m_candidates:
+        if m is None:
+            continue
+        if m not in seen:
+            m_candidates_uniq.append(m)
+            seen.add(m)
+    if not m_candidates_uniq:
+        print("[!] No m candidates recovered by repeated sqrt. You can supply known m values to 'use_known_m_candidates'.")
+        # helpful fallback: if you have a known m from experimentation (e.g., 636292670), add it:
+        print("    Example fallback usage: use_known_m_candidates=[636292670]")
+        # still continue but nothing to show
+        return
+
+    # For each candidate m produce the 16 bytes (4 blocks of 4 bytes each)
+    for idx, m in enumerate(m_candidates_uniq):
+        blocks = [n, s0, c, m]
+        raw = b''.join(long_to_bytes(x, 4) for x in blocks)
+        print("\n--- Candidate #%d ---" % (idx+1))
+        print("m =", m)
+        print("raw 16 bytes (hex):", raw.hex())
+        print("raw 16 bytes (ascii-ish):", ascii_view(raw))
+
+        # show some decodings / heuristics
+        decs = try_simple_transforms(raw)
+        for name, out in decs:
+            if out is None:
+                print("  %-24s : <failed>" % name)
+            else:
+                if isinstance(out, bytes):
+                    out = ascii_view(out)
+                print("  %-24s : %s" % (name, out))
+
+        # If one of the decodings already looks like a flag, print that clearly
+        if b"CRACCON{" in raw or b"craccon{" in raw:
+            print("  => raw already contains 'CRACCON{' :", ascii_view(raw))
+
+    print("\n[*] Done. If the 16 bytes are actually a PowerShell command or an obfuscated payload")
+    print("    you should now take the printed raw bytes and:")
+    print("      - either run them inside a sandboxed PowerShell (careful!) to see the output,")
+    print("      - or examine them for index lists, %xx sequences, UTF-16LE text, or simple XOR")
+    print("    The script includes simple heuristics (percent-unquote, swapping endianness, xor keys).")
+
+# -------------- If you already know a specific m that worked for you, pass it here --------------
+if __name__ == "__main__":
+    # Example: If an earlier run gave m=636292670 (or its complement), you can include it:
+    # main(try_repeated_sqrt=False, use_known_m_candidates=[636292670, 1496339807-636292670])
+    # If you want the script to attempt the heavy repeated-sqrt, set try_repeated_sqrt=True:
+    main(try_repeated_sqrt=False, use_known_m_candidates=[636292670, 1496339807 - 636292670])

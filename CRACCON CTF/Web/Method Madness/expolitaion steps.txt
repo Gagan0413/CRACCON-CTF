@@ -1,0 +1,17 @@
+!!!!!!!!!! Exploitation !!!!!!!!!!!!!
+
+step 1 : start the instance
+
+step 2 : start burpsuite and connect it with browser
+
+step 3 : then under "http history" section look the header
+
+step 4 :  POST /api/coupon/apply-coupon 
+
+step 5 : POST header to -> "GET" and send the request again to server
+
+step 6 : u will get the flag in responce  CRACCON{8dnd8D863fgvvd7732ghdCDC27}    <- like this   
+
+
+
+NOTE: i dont have ss for this one , cuz i thought will make it after CTF but server were "off"

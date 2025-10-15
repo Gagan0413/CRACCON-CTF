@@ -1,0 +1,6 @@
+!!!!!!!!!!!!!!!!!!!!  FLAG  !!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+
+
+
+
+Correct flag was: CRCCCON{knock_knock_q8r5m2z7t1x9}

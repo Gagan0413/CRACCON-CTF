@@ -1,0 +1,4 @@
+!!!!!!!!!!!!!!!! FLAG !!!!!!!!!!!!!!!!
+
+
+Correct flag: CRACCON{windsor_castle}
